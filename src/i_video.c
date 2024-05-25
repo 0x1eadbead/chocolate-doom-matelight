@@ -342,21 +342,22 @@ static void ML_MaybeSendFrame()
 
 static void ML_Init_Network()
 {
-    ml_socket = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    ml_socket = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, IPPROTO_UDP);
     if (ml_socket < 0)
     {
         POSIX_ERROR("Create socket");
     }
 
+    ml_bind_addr.sin_port = htons(ml_bind_addr.sin_port);
     if (bind(ml_socket, (const struct sockaddr*)&ml_bind_addr, sizeof(ml_bind_addr)))
     {
         POSIX_ERROR("Bind socket");
     }
 
     inet_pton(AF_INET, ml_addr_str, &ml_addr.sin_addr);
-
+    ml_addr.sin_port = htons(ml_addr.sin_port);
     inet_pton(AF_INET, ml_master_addr_str, &ml_master_addr.sin_addr);
-
+    ml_master_addr.sin_port = htons(ml_master_addr.sin_port);
     ML_MaybeSendHandshake();
 
     ml_frame_payload = calloc(ML_WIDTH * ML_HEIGHT * 3 + 4, 1);
