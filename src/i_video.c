@@ -19,6 +19,8 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <time.h>
 
 #include "SDL.h"
 #include "SDL_opengl.h"
@@ -47,6 +49,74 @@
 #include "v_video.h"
 #include "w_wad.h"
 #include "z_zone.h"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/fcntl.h>
+#include <sys/socket.h>
+
+#define ML_WIDTH 40
+#define ML_HEIGHT 16
+
+#define ML_PIXEL_FORMAT SDL_PIXELFORMAT_BGR24
+
+#define ML_PART_WIDTH SCREENWIDTH
+#define ML_PART_HEIGHT SCREENHEIGHT
+
+static SDL_Rect ml_target_blit_rect = {
+    0,
+    0,
+    ML_WIDTH,
+    ML_HEIGHT,
+};
+
+#define SDL_ERROR(MSG) do { \
+    I_Error(MSG " failed: %s", SDL_GetError()); \
+} while(0)
+
+#define SDL_CHECKED(OP) do { \
+    if (OP) \
+        SDL_ERROR(#OP); \
+} while(0)
+
+#define POSIX_ERROR(MSG) do { \
+    int __err = errno; \
+    I_Error(MSG " failed: %d", __err); \
+} while(0)
+
+static SDL_Window *ml_dbg_screen;
+static SDL_Renderer *ml_dbg_renderer;
+static SDL_Surface *ml_dbg_surface;
+static SDL_Texture *ml_dbg_texture;
+
+static SDL_Surface *ml_surface;
+static SDL_Surface *ml_surface2;
+static SDL_Surface *ml_texture_surface;
+static SDL_Texture *ml_texture;
+
+static int ml_socket;
+static void* ml_frame_payload;
+static const size_t ml_frame_payload_size = ML_WIDTH * ML_HEIGHT * 3 + 4;
+static unsigned long ml_skipped_frames = 0;
+static unsigned long ml_handshake_time = 0;
+static struct sockaddr_in ml_bind_addr = {
+    .sin_family = AF_INET,
+    .sin_port = 10042,
+    .sin_addr = 0,
+};
+
+static struct sockaddr_in ml_addr = {
+    .sin_family = AF_INET,
+    .sin_port = 10042,
+    .sin_addr = 0,
+};
+
+static const char ml_addr_str[INET_ADDRSTRLEN] = "10.0.1.39";
+
+static const char ml_handshake_payload[] = "/batchsubscribe\x00"
+    ",ssiii\x00\x00"
+    "meters/15\x00\x00\x00"
+    "/meters/15\x00\x00\x00\x00\x00\x10\x00\x00\x00\x10\x00\x00\x00\x01";
 
 // These are (1) the window (or the full screen) that our game is rendered to
 // and (2) the renderer that scales the texture (see below) into this window.
@@ -168,7 +238,7 @@ boolean screensaver_mode = false;
 
 boolean screenvisible = true;
 
-// If true, we display dots at the bottom of the screen to 
+// If true, we display dots at the bottom of the screen to
 // indicate FPS.
 
 static boolean display_fps_dots;
@@ -178,7 +248,7 @@ static boolean display_fps_dots;
 
 static boolean noblit;
 
-// Callback function to invoke to determine whether to grab the 
+// Callback function to invoke to determine whether to grab the
 // mouse pointer.
 
 static grabmouse_callback_t grabmouse_callback = NULL;
@@ -205,10 +275,274 @@ static const unsigned int *icon_data;
 static int icon_w;
 static int icon_h;
 
+static void ML_SendData(const void* data, size_t size)
+{
+    // TODO: handle eintr and stuff
+    ssize_t sent = sendto(ml_socket, data, size, MSG_NOSIGNAL, (struct sockaddr*)&ml_addr, sizeof(ml_addr));
+    if (sent < size)
+    {
+        errno = EPIPE;
+        POSIX_ERROR("Partial datagram send");
+    }
+
+    if (sent < 0)
+    {
+        POSIX_ERROR("Send datagram");
+    }
+}
+
+static void ML_MaybeSendHandshake()
+{
+    unsigned long ct = time(NULL);
+    if (ct - ml_handshake_time > 5) {
+        printf("$$$ Sending handshake\n");
+        ml_handshake_time = ct;
+        ML_SendData(ml_handshake_payload, sizeof(ml_handshake_payload) - 1);
+    }
+}
+
+static uint8_t recv_buf[1024];
+static void ML_MaybeSendFrame()
+{
+    // TODO: wait for signal from ml
+    ssize_t sz = recv(ml_socket, recv_buf, sizeof(recv_buf), MSG_NOSIGNAL);
+    if (sz == 0)
+    {
+        sz = -1;
+        errno = EPIPE;
+    }
+
+    if (sz < 0)
+    {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        {
+            ++ml_skipped_frames;
+            if (ml_skipped_frames >= 300)
+            {
+                printf("Skipped %lu frames\n", ml_skipped_frames);
+                ml_skipped_frames = 0;
+            }
+            return;
+        }
+
+        POSIX_ERROR("Sending framebuffer");
+    }
+
+    ml_skipped_frames = 0;
+    memcpy(ml_frame_payload, ml_texture_surface->pixels, ML_WIDTH * ML_HEIGHT * 3);
+    ML_SendData(ml_frame_payload, ml_frame_payload_size);
+}
+
+static void ML_Init_Network()
+{
+    ml_socket = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    if (ml_socket < 0)
+    {
+        POSIX_ERROR("Create socket");
+    }
+
+    if (bind(ml_socket, (const struct sockaddr*)&ml_bind_addr, sizeof(ml_bind_addr)))
+    {
+        POSIX_ERROR("Bind socket");
+    }
+
+    inet_pton(AF_INET, ml_addr_str, &ml_addr.sin_addr);
+
+    ML_MaybeSendHandshake();
+
+    ml_frame_payload = calloc(ML_WIDTH * ML_HEIGHT * 3 + 4, 1);
+    if (ml_frame_payload == NULL)
+    {
+        errno = ENOMEM;
+        POSIX_ERROR("Failed to allocate ml frame payload");
+    }
+}
+
+static void ML_Init()
+{
+    unsigned int rmask, gmask, bmask, amask;
+    int bpp;
+    uint32_t pixel_format;
+
+    ml_dbg_screen = SDL_CreateWindow("ML debug", 120, 120, ML_WIDTH * 16, ML_HEIGHT * 16, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
+    if (ml_dbg_screen == NULL)
+    {
+        I_Error("Error creating window for ml debug: %s",
+        SDL_GetError());
+    }
+
+    ml_dbg_renderer = SDL_CreateRenderer(ml_dbg_screen, -1, SDL_RENDERER_TARGETTEXTURE);
+    if (ml_dbg_renderer == NULL)
+    {
+        I_Error("Error creating renderer for ml debug: %s",
+        SDL_GetError());
+    }
+
+    SDL_SetRenderDrawColor(ml_dbg_renderer, 0, 0, 0, 255);
+    SDL_RenderClear(ml_dbg_renderer);
+    SDL_RenderPresent(ml_dbg_renderer);
+
+    pixel_format = SDL_GetWindowPixelFormat(ml_dbg_screen);
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
+    ml_dbg_texture = SDL_CreateTexture(ml_dbg_renderer,
+                                pixel_format,
+                                SDL_TEXTUREACCESS_TARGET,
+                                ML_WIDTH,
+                                ML_HEIGHT);
+    if (ml_dbg_texture == NULL)
+    {
+        SDL_ERROR("Failed to create texture");
+    }
+
+    pixel_format = SDL_GetWindowPixelFormat(ml_dbg_screen);
+    SDL_PixelFormatEnumToMasks(pixel_format, &bpp,
+                                   &rmask, &gmask, &bmask, &amask);
+
+    ml_dbg_surface = SDL_CreateRGBSurface(0, ML_WIDTH, ML_HEIGHT, bpp, rmask, gmask, bmask, amask);
+    if (ml_dbg_surface == NULL)
+    {
+        SDL_ERROR("Failed to create ml dbg surface");
+    }
+    SDL_CHECKED(SDL_FillRect(ml_dbg_surface, NULL, 0));
+
+
+    pixel_format = ML_PIXEL_FORMAT;
+    SDL_PixelFormatEnumToMasks(pixel_format, &bpp,
+                                   &rmask, &gmask, &bmask, &amask);
+
+    ml_surface = SDL_CreateRGBSurface(0, SCREENWIDTH, SCREENHEIGHT, bpp, rmask, gmask, bmask, amask);
+    if (ml_surface == NULL)
+    {
+        SDL_ERROR("Failed to create ml surface");
+    }
+    SDL_CHECKED(SDL_FillRect(ml_surface, NULL, 0));
+
+    ml_surface2 = SDL_CreateRGBSurface(0, SCREENWIDTH, SCREENHEIGHT, bpp, rmask, gmask, bmask, amask);
+    if (ml_surface2 == NULL)
+    {
+        SDL_ERROR("Failed to create ml surface 2");
+    }
+    SDL_CHECKED(SDL_FillRect(ml_surface2, NULL, 0));
+
+    ml_texture_surface = SDL_CreateRGBSurface(0, ML_WIDTH, ML_HEIGHT, bpp, rmask, gmask, bmask, amask);
+    if (ml_texture_surface == NULL)
+    {
+        SDL_ERROR("Failed to create ml texture surface");
+    }
+    SDL_CHECKED(SDL_FillRect(ml_texture_surface, NULL, 0));
+
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
+    ml_texture = SDL_CreateTexture(renderer,
+                                pixel_format,
+                                SDL_TEXTUREACCESS_TARGET,
+                                ML_WIDTH,
+                                ML_HEIGHT);
+
+    ML_Init_Network();
+}
+
+#define PPX(pixels, x, y) ((pixels) + (y) * SCREENWIDTH * 3 + (x) * 3)
+#define FPX(pixels, x, y, c) ((float)(PPX((uint8_t*)(pixels), (x), (y))[c]))
+
+#define PX(pixels, x, y, c) (PPX((uint8_t*)(pixels), (x), (y))[c])
+
+static void ML_Render()
+{
+    SDL_CHECKED(SDL_LowerBlit(argbbuffer, &blit_rect, ml_surface, &blit_rect));
+
+    uint8_t median_array[25];
+
+    for (size_t x = 0; x < SCREENWIDTH; ++x) {
+        for (size_t y = 0; y < SCREENHEIGHT; ++y) {
+            uint8_t* spx = PPX(ml_surface->pixels, x, y);
+            uint8_t* tpx = PPX(ml_surface2->pixels, x, y);
+
+            for (size_t c = 0; c < 3; ++c) {
+                if (x < 2 || y < 2 || x >= SCREENWIDTH - 2 || y >= SCREENHEIGHT - 2) {
+                    tpx[c] = spx[c];
+                    continue;
+                }
+
+                size_t mdc = 0;
+                for (int dx = -2; dx <= 2; ++dx) {
+                    for (int dy = -2; dy <= 2; ++dy) {
+                        median_array[mdc] = PX(ml_surface->pixels, x + dx, y + dy, c);
+                        ++mdc;
+                    }
+                }
+
+                uint32_t sum = 0;
+                for (size_t i = 0; i < 25; ++i) {
+                    sum += median_array[i];
+                }
+
+                tpx[c] = sum / 25;
+
+                /*float tv =
+                    FPX(ml_surface->pixels, x- 1, y - 1, c) * 1.0 / 9.0  +
+                    FPX(ml_surface->pixels, x, y -1, c) * 1.0 / 9.0 +
+                    FPX(ml_surface->pixels, x + 1, y - 1, c) * 1.0 / 9.0  +
+                    FPX(ml_surface->pixels, x - 1, y, c) * 1.0 / 9.0  +
+                    FPX(ml_surface->pixels, x, y, c) * 1.0 / 9.0 +
+                    FPX(ml_surface->pixels, x + 1, y, c) * 1.0 / 9.0 +
+                    FPX(ml_surface->pixels, x - 1, y + 1, c) * 1.0 / 9.0  +
+                    FPX(ml_surface->pixels, x, y + 1, c) * 1.0 / 9.0 +
+                    FPX(ml_surface->pixels, x + 1, y + 1, c) * 1.0 / 9.0;
+                tpx[c] = (uint8_t)tv;*/
+                tpx[c] = spx[c];
+            }
+        }
+    }
+
+    SDL_CHECKED(SDL_LowerBlit(ml_surface2, &blit_rect, argbbuffer, &blit_rect));
+    SDL_CHECKED(SDL_UpdateTexture(texture, NULL, argbbuffer->pixels, argbbuffer->pitch));
+
+    SDL_CHECKED(SDL_SetRenderTarget(renderer, ml_texture));
+    SDL_CHECKED(SDL_RenderClear(renderer));
+    SDL_CHECKED(SDL_RenderCopy(renderer, texture, NULL, NULL));
+
+    SDL_CHECKED(SDL_RenderReadPixels(renderer,
+        NULL,
+        ML_PIXEL_FORMAT,
+        ml_texture_surface->pixels,
+        ml_texture_surface->pitch));
+
+    SDL_CHECKED(SDL_RenderReadPixels(renderer,
+        NULL,
+        SDL_GetWindowPixelFormat(ml_dbg_screen),
+        ml_dbg_surface->pixels,
+        ml_dbg_surface->pitch));
+    SDL_CHECKED(SDL_UpdateTexture(ml_dbg_texture, NULL, ml_dbg_surface->pixels, ml_dbg_surface->pitch));
+
+    SDL_CHECKED(SDL_RenderClear(ml_dbg_renderer));
+    SDL_CHECKED(SDL_RenderCopy(ml_dbg_renderer, ml_dbg_texture, NULL, NULL));
+    SDL_RenderPresent(ml_dbg_renderer);
+
+    ML_MaybeSendHandshake();
+    ML_MaybeSendFrame();
+    //SDL_UpdateTexture(ml_full_texture, NULL, argbbuffer->pixels, argbbuffer->pitch);
+
+    /*if (SDL_SetRenderTarget(ml_dbg_renderer, ml_texture))
+    {
+        I_Error("Failed to set render target: %s",
+        SDL_GetError());
+    }
+    if (SDL_RenderCopy(ml_dbg_renderer, ml_full_texture, NULL, NULL))
+    {
+        I_Error("Error copying full texture: %s",
+        SDL_GetError());
+    }
+
+    SDL_SetRenderTarget(ml_dbg_renderer, NULL);
+    SDL_RenderCopy(ml_dbg_renderer, ml_texture, NULL, NULL);
+
+    SDL_RenderPresent(ml_dbg_renderer);*/
+}
+
 static boolean MouseShouldBeGrabbed()
 {
     // never grab the mouse when in screensaver mode
-   
+
     if (screensaver_mode)
         return false;
 
@@ -217,7 +551,7 @@ static boolean MouseShouldBeGrabbed()
     if (!window_focused)
         return false;
 
-    // always grab the mouse when full screen (dont want to 
+    // always grab the mouse when full screen (dont want to
     // see the mouse pointer)
 
     if (fullscreen)
@@ -381,7 +715,7 @@ static boolean ToggleFullScreenKeyShortcut(SDL_Keysym *sym)
 #if defined(__MACOSX__)
     flags |= (KMOD_LGUI | KMOD_RGUI);
 #endif
-    return (sym->scancode == SDL_SCANCODE_RETURN || 
+    return (sym->scancode == SDL_SCANCODE_RETURN ||
             sym->scancode == SDL_SCANCODE_KP_ENTER) && (sym->mod & flags) != 0;
 }
 
@@ -737,7 +1071,7 @@ void I_FinishUpdate (void)
 
 #if 0 // SDL2-TODO
     // Don't update the screen if the window isn't visible.
-    // Not doing this breaks under Windows when we alt-tab away 
+    // Not doing this breaks under Windows when we alt-tab away
     // while fullscreen.
 
     if (!(SDL_GetAppState() & SDL_APPACTIVE))
@@ -806,8 +1140,9 @@ void I_FinishUpdate (void)
 
     // Restore background and undo the disk indicator, if it was drawn.
     V_RestoreDiskBackground();
-}
 
+    ML_Render();
+}
 
 //
 // I_ReadScreen
@@ -868,7 +1203,7 @@ int I_GetPaletteIndex(int r, int g, int b)
     return best;
 }
 
-// 
+//
 // Set the window title
 //
 
@@ -878,7 +1213,7 @@ void I_SetWindowTitle(const char *title)
 }
 
 //
-// Call the SDL function to set the window title, based on 
+// Call the SDL function to set the window title, based on
 // the title set with I_SetWindowTitle.
 //
 
@@ -948,7 +1283,7 @@ void I_GraphicsCheckCommandLine(void)
     noblit = M_CheckParm ("-noblit");
 
     //!
-    // @category video 
+    // @category video
     //
     // Don't grab the mouse when running in windowed mode.
     //
@@ -959,7 +1294,7 @@ void I_GraphicsCheckCommandLine(void)
     // nofullscreen because we love prboom
 
     //!
-    // @category video 
+    // @category video
     //
     // Run in a window.
     //
@@ -970,7 +1305,7 @@ void I_GraphicsCheckCommandLine(void)
     }
 
     //!
-    // @category video 
+    // @category video
     //
     // Run in fullscreen mode.
     //
@@ -981,7 +1316,7 @@ void I_GraphicsCheckCommandLine(void)
     }
 
     //!
-    // @category video 
+    // @category video
     //
     // Disable the mouse.
     //
@@ -1064,7 +1399,7 @@ void I_GraphicsCheckCommandLine(void)
     // Don't scale up the screen. Implies -window.
     //
 
-    if (M_CheckParm("-1")) 
+    if (M_CheckParm("-1"))
     {
         SetScaleFactor(1);
     }
@@ -1075,7 +1410,7 @@ void I_GraphicsCheckCommandLine(void)
     // Double up the screen to 2x its normal size. Implies -window.
     //
 
-    if (M_CheckParm("-2")) 
+    if (M_CheckParm("-2"))
     {
         SetScaleFactor(2);
     }
@@ -1086,7 +1421,7 @@ void I_GraphicsCheckCommandLine(void)
     // Double up the screen to 3x its normal size. Implies -window.
     //
 
-    if (M_CheckParm("-3")) 
+    if (M_CheckParm("-3"))
     {
         SetScaleFactor(3);
     }
@@ -1257,7 +1592,7 @@ static void SetVideoMode(void)
     // The SDL_RENDERER_TARGETTEXTURE flag is required to render the
     // intermediate texture into the upscaled texture.
     renderer_flags = SDL_RENDERER_TARGETTEXTURE;
-	
+
     if (SDL_GetCurrentDisplayMode(video_display, &mode) != 0)
     {
         I_Error("Could not get display mode for video display #%d: %s",
@@ -1401,6 +1736,8 @@ static void SetVideoMode(void)
     // Initially create the upscaled texture for rendering to screen
 
     CreateUpscaledTexture(true);
+
+    ML_Init();
 }
 
 void I_InitGraphics(void)
@@ -1409,7 +1746,7 @@ void I_InitGraphics(void)
     byte *doompal;
     char *env;
 
-    // Pass through the XSCREENSAVER_WINDOW environment variable to 
+    // Pass through the XSCREENSAVER_WINDOW environment variable to
     // SDL_WINDOWID, to embed the SDL window into the Xscreensaver
     // window.
 
@@ -1428,7 +1765,7 @@ void I_InitGraphics(void)
 
     SetSDLVideoDriver();
 
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) 
+    if (SDL_Init(SDL_INIT_VIDEO) < 0)
     {
         I_Error("Failed to initialize video: %s", SDL_GetError());
     }
@@ -1491,7 +1828,7 @@ void I_InitGraphics(void)
     memset(I_VideoBuffer, 0, SCREENWIDTH * SCREENHEIGHT * sizeof(*I_VideoBuffer));
 
     // clear out any events waiting at the start and center the mouse
-  
+
     while (SDL_PollEvent(&dummy));
 
     initialized = true;
