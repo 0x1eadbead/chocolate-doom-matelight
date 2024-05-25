@@ -107,11 +107,18 @@ static struct sockaddr_in ml_bind_addr = {
 
 static struct sockaddr_in ml_addr = {
     .sin_family = AF_INET,
-    .sin_port = 10042,
+    .sin_port = 1337,
+    .sin_addr = 0,
+};
+
+static struct sockaddr_in ml_master_addr = {
+    .sin_family = AF_INET,
+    .sin_port = 10023,
     .sin_addr = 0,
 };
 
 static const char ml_addr_str[INET_ADDRSTRLEN] = "10.0.1.39";
+static const char ml_master_addr_str[INET_ADDRSTRLEN] = "10.0.1.37";
 
 static const char ml_handshake_payload[] = "/batchsubscribe\x00"
     ",ssiii\x00\x00"
@@ -275,10 +282,10 @@ static const unsigned int *icon_data;
 static int icon_w;
 static int icon_h;
 
-static void ML_SendData(const void* data, size_t size)
+static void ML_SendData(const void* data, size_t size, struct sockaddr_in* to)
 {
     // TODO: handle eintr and stuff
-    ssize_t sent = sendto(ml_socket, data, size, MSG_NOSIGNAL, (struct sockaddr*)&ml_addr, sizeof(ml_addr));
+    ssize_t sent = sendto(ml_socket, data, size, MSG_NOSIGNAL, (struct sockaddr*)to, sizeof(struct sockaddr_in));
     if (sent < size)
     {
         errno = EPIPE;
@@ -297,7 +304,7 @@ static void ML_MaybeSendHandshake()
     if (ct - ml_handshake_time > 5) {
         printf("$$$ Sending handshake\n");
         ml_handshake_time = ct;
-        ML_SendData(ml_handshake_payload, sizeof(ml_handshake_payload) - 1);
+        ML_SendData(ml_handshake_payload, sizeof(ml_handshake_payload) - 1, &ml_master_addr);
     }
 }
 
@@ -330,7 +337,7 @@ static void ML_MaybeSendFrame()
 
     ml_skipped_frames = 0;
     memcpy(ml_frame_payload, ml_texture_surface->pixels, ML_WIDTH * ML_HEIGHT * 3);
-    ML_SendData(ml_frame_payload, ml_frame_payload_size);
+    ML_SendData(ml_frame_payload, ml_frame_payload_size, &ml_addr);
 }
 
 static void ML_Init_Network()
@@ -347,6 +354,8 @@ static void ML_Init_Network()
     }
 
     inet_pton(AF_INET, ml_addr_str, &ml_addr.sin_addr);
+
+    inet_pton(AF_INET, ml_master_addr_str, &ml_master_addr.sin_addr);
 
     ML_MaybeSendHandshake();
 
@@ -489,7 +498,7 @@ static void ML_Render()
                     FPX(ml_surface->pixels, x, y + 1, c) * 1.0 / 9.0 +
                     FPX(ml_surface->pixels, x + 1, y + 1, c) * 1.0 / 9.0;
                 tpx[c] = (uint8_t)tv;*/
-                tpx[c] = spx[c];
+                //tpx[c] = spx[c];
             }
         }
     }
